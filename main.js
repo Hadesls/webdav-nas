@@ -1,11 +1,11 @@
 'use strict';
 /* WebDAV nas —— 轻量 WebDAV 同步插件（作者 Hadesr） */
 
-const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal, setIcon } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal, setIcon, Platform } = require('obsidian');
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.7.1';
+const VERSION = '2.7.2';
 
 /* 路径归一化 + 本插件文件分类 */
 function normRel(p) { return String(p || '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, ''); }
@@ -967,38 +967,75 @@ class WebdavFnos extends Plugin {
       `.obsidian/plugins/${PLUGIN_ID}/data.json.bak`,
     ]);
     const skipSuffix = ['.bak', '.bak2', '.bak3', '.tmp'];
-// 逻辑为空的目录：整目录移入回收站（系统回收站优先，退回库内 .trash）。
-    const trashDir = async (d) => {
-      // 1) 官方 Vault.trash：先尝试系统回收站（Mac ~/.Trash / Windows 回收站），失败自动退回库内 .trash。需抽象文件对象。
+// 逻辑为空的目录：整目录移入回收站（桌面优先系统回收站；移动端直接进库内 .trash）。
+    const ad = this.app.vault.adapter;
+    // 目录是否存在：不要用 adapter.exists —— 移动端对 .obsidian 隐藏目录可能误报 false。
+    const dirExists = async (p) => {
+      const parts = String(p).split('/');
+      const base = parts.pop();
+      const parent = parts.join('/');
       try {
-        const af = this.app.vault.getAbstractFileByPath(d);
-        if (af && typeof this.app.vault.trash === 'function') { await this.app.vault.trash(af, true); return; }
-      } catch (e) { /* 取不到抽象文件或失败 → 走 adapter 级 */ }
-      const ad = this.app.vault.adapter;
-      // 2) 系统回收站（用户要的"放回收站"即这一层）—— macOS ~/Trash、Windows 回收站、Linux 桌面垃圾桶
-      if (typeof ad.trashSystem === 'function') {
-        try { await ad.trashSystem(d); return; } catch (e) { /* 系统回收站被禁用 → 库内 .trash */ }
-      }
-      // 3) 库内 .trash（可恢复，Obsidian 默认约 30 天后清）。同名已存在则加时间戳避免覆盖。
-      if (typeof ad.trashLocal === 'function') {
-        try { await ad.trashLocal(d); return; }
-        catch (e) {
-          if (e && e.code === 'EEXIST') {
-            await ad.mkdir('.trash');
-            await ad.rename(d, `.trash/${d}__${Date.now()}`);
-            return;
+        const list = await ad.list(parent);
+        if ((list.folders || []).some((f) => {
+          const rel = normRel(f);
+          return rel === p || rel.split('/').pop() === base;
+        })) return true;
+      } catch (e) { /* list 失败时用 stat 兜底 */ }
+      try {
+        const st = await ad.stat(p);
+        return !!(st && (st.type === 'folder' || st.isDirectory));
+      } catch (e) { return false; }
+    };
+    const flatName = (d) => `${d.replace(/\//g, '__')}__${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const trashDir = async (d) => {
+      if (!(await dirExists(d))) return false;   // 已被更深的子目录/上一轮顺带移走
+
+      // 移动端没有系统回收站：vault.trash(..., true) 可能“假成功”，所以直接走库内 .trash。
+      if (Platform && Platform.isMobile) {
+        try {
+          const af = this.app.vault.getAbstractFileByPath(d);
+          if (af && typeof this.app.vault.trash === 'function') {
+            await this.app.vault.trash(af, false);   // false = 库内 .trash
+            if (!(await dirExists(d))) return true;
           }
-          throw e;
+        } catch (e) { if (!(await dirExists(d))) return true; }
+      } else {
+        // 桌面：先系统回收站（macOS 废纸篓 / Windows 回收站）
+        try {
+          const af = this.app.vault.getAbstractFileByPath(d);
+          if (af && typeof this.app.vault.trash === 'function') {
+            await this.app.vault.trash(af, true);
+            if (!(await dirExists(d))) return true;
+          }
+        } catch (e) { if (!(await dirExists(d))) return true; }
+        if (typeof ad.trashSystem === 'function') {
+          try {
+            await ad.trashSystem(d);
+            if (!(await dirExists(d))) return true;
+          } catch (e) { if (!(await dirExists(d))) return true; }
         }
       }
-      // 4) 极旧版本都没有 trash 方法 → 直接 rename 到 .trash（仍是移动、可逆，不会永久丢失）
-      await ad.mkdir('.trash');
-      await ad.rename(d, `.trash/${d}__${Date.now()}`);
+
+      // 库内 .trash（桌面/移动端都可用）；失败就继续手动 rename。
+      if (typeof ad.trashLocal === 'function') {
+        try {
+          await ad.trashLocal(d);
+          if (!(await dirExists(d))) return true;
+        } catch (e) {
+          if (!(await dirExists(d))) return true;
+          console.warn(PREFIX, 'trashLocal 失败，改用手动移动', d, (e && e.message) || e);
+        }
+      }
+
+      // 最后兜底：手动 rename 到 .trash。必须扁平化，否则 .trash/A/B__时间 的父目录 A 不存在。
+      try { await ad.mkdir('.trash'); } catch (e) { /* 已存在 */ }
+      await ad.rename(d, `.trash/${flatName(d)}`);
+      if (await dirExists(d)) throw new Error(`目录仍在原位置: ${d}`);
+      return true;
     };
     let candidates = [...new Set(parents)].filter((d) => d && !guard(d));
     let changed = true, rounds = 0, removed = 0;
-    const failed = [];                       // 本次没删掉的目录（用于 Mac 兜底提醒）
-    this._failedLocalDirs = [];
+    const failed = [];                       // 本次没删掉的目录（用于兜底提醒）
     while (changed && rounds < 50) {
       changed = false; rounds++;
       candidates.sort((a, b) => b.split('/').length - a.split('/').length); // 最深优先
@@ -1008,8 +1045,8 @@ class WebdavFnos extends Plugin {
         if (under(d, localFiles) || under(d, remoteFiles)) { next.push(d); continue; }
 // 确认无真实文件：整目录移入回收站（可恢复）。
         try {
-          await trashDir(d);
-          removed++;
+          const didMove = await trashDir(d);
+          if (didMove) removed++;
           changed = true;
           const p = d.split('/').slice(0, -1).join('/');
           if (p && !guard(p) && !next.includes(p)) next.push(p);
@@ -1026,7 +1063,7 @@ class WebdavFnos extends Plugin {
       }
       candidates = next;
     }
-    this._failedLocalDirs = [...new Set(failed)];
+    this._failedLocalDirs = [...new Set([...(this._failedLocalDirs || []), ...failed])];
     return removed;
   }
 
@@ -1038,6 +1075,7 @@ class WebdavFnos extends Plugin {
       return;
     }
     this.syncing = true;
+    this._failedLocalDirs = [];
     this.setSyncBtn('⟳ 同步中…');
     let notice = null;
     try {
@@ -1273,10 +1311,15 @@ class WebdavFnos extends Plugin {
       // Mac 专属兜底提醒：自动移入回收站万一失败，明确告诉用户去 Finder 手动移到废纸篓（不受任何开关/设置控制，只要本轮确认过删除且 Mac 端有残留就弹）。
       const isMac = (typeof process !== 'undefined' && process.platform === 'darwin');
       const failDirs = this._failedLocalDirs || [];
-      if (isMac && failDirs.length) {
+      if (failDirs.length) {
         const list2 = failDirs.join('、');
-        console.warn(PREFIX, 'Mac 本地空目录自动移入回收站失败，需用户在 Finder 手动移到废纸篓：', failDirs);
-        new Notice(`${PREFIX} ⚠️ Mac：有 ${failDirs.length} 个本地空目录没能自动移入回收站，请到 Finder 手动移到废纸篓：${list2}`, 20000);
+        if (isMac) {
+          console.warn(PREFIX, 'Mac 本地空目录自动移入回收站失败，需用户在 Finder 手动移到废纸篓：', failDirs);
+          new Notice(`${PREFIX} ⚠️ Mac：有 ${failDirs.length} 个本地空目录没能自动移入回收站，请到 Finder 手动移到废纸篓：${list2}`, 20000);
+        } else {
+          console.warn(PREFIX, '本地空目录自动移入回收站失败：', failDirs);
+          new Notice(`${PREFIX} ⚠️ 有 ${failDirs.length} 个本地空目录没能移入回收站：${list2}`, 15000);
+        }
       }
     } catch (e) {
       if (notice) notice.hide();
